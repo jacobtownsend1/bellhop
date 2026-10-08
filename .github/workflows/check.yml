@@ -1,0 +1,26 @@
+name: Check
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux zsh
+      - if: runner.os == 'macOS'
+        run: |
+          brew list tmux >/dev/null 2>&1 || brew install tmux
+          printf 'TERMINFO_DIRS=%s/share/terminfo:/usr/share/terminfo\n' "$(brew --prefix ncurses)" >> "$GITHUB_ENV"
+      - run: make check
