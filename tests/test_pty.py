@@ -40,7 +40,7 @@ class TerminalTests(IsolatedTmux):
         terminal.send(b'\x1b')
         terminal.wait(lambda: terminal.process.poll() is not None)
         self.assertEqual(terminal.process.returncode, 0)
-        self.assertEqual(termios.tcgetattr(terminal.slave), terminal.before)
+        self.assertEqual(terminal.after, terminal.before)
         self.assertEqual(self.adapter.list_sessions(), [])
 
     def test_create_attach_and_disconnect(self):
@@ -280,7 +280,7 @@ class TerminalTests(IsolatedTmux):
         terminal.wait(lambda: b'\x1b[?25l' in terminal.output[before:])
         terminal.send(b'\x1b')
         terminal.wait(lambda: terminal.process.poll() is not None)
-        self.assertEqual(termios.tcgetattr(terminal.slave), terminal.before)
+        self.assertEqual(terminal.after, terminal.before)
 
     def test_color_and_no_color_terminal_modes(self):
         for disabled in (False, True):
@@ -314,7 +314,7 @@ class TerminalTests(IsolatedTmux):
         terminal.send(b'\x1b\x1b')
         terminal.wait(lambda: terminal.process.poll() is not None)
         self.assertEqual(terminal.process.returncode, 0)
-        self.assertEqual(termios.tcgetattr(terminal.slave), terminal.before)
+        self.assertEqual(terminal.after, terminal.before)
 
     def test_separate_terminal_launched_from_tmux_opens_lobby(self):
         first = self.adapter.create_session('origin', self.temp.name)
@@ -343,8 +343,11 @@ class TerminalTests(IsolatedTmux):
         result = subprocess.run(['sh', str(prefix / 'share/bellhop/bellhop.tmux')],
                                 env=dict(self.env, TMUX=socket + ',1,0'), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        binding = self.tmux_command('list-keys', '-T', 'prefix', 'B').stdout
-        self.assertIn(str(prefix), binding)
+        # tmux 3.7 sends a single matching key to the client's status line.
+        # Listing the table keeps the binding available on stdout.
+        bindings = self.tmux_command('list-keys', '-T', 'prefix')
+        self.assertEqual(bindings.returncode, 0, bindings.stderr)
+        self.assertIn(str(prefix), bindings.stdout)
         terminal.send(b'\x02B')
         terminal.wait_text('tmux lobby')
         terminal.send(b'\x1b')
@@ -358,7 +361,7 @@ class TerminalTests(IsolatedTmux):
         terminal.send(b'\x03')
         terminal.wait(lambda: terminal.process.poll() is not None)
         self.assertEqual(terminal.process.returncode, 0)
-        self.assertEqual(termios.tcgetattr(terminal.slave), terminal.before)
+        self.assertEqual(terminal.after, terminal.before)
 
     def test_separate_terminal_with_inherited_environment_attaches_its_own_client(self):
         first = self.adapter.create_session('a-origin', self.temp.name)

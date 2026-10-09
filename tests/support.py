@@ -2,6 +2,7 @@ import os
 import errno
 import fcntl
 import pty
+import pickle
 import select
 import signal
 import socket as socket_module
@@ -17,7 +18,9 @@ import uuid
 
 class IsolatedTmux(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # macOS's default temporary path can exceed the Unix socket limit
+        # once tmux adds its UID directory and our unique socket name.
+        self.temp = tempfile.TemporaryDirectory(dir=os.path.realpath('/tmp'))
         self.prefix = ['tmux', '-L', 'bellhop-test-' + uuid.uuid4().hex, '-f', '/dev/null']
         self.env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
                     'HOME': self.temp.name, 'SHELL': '/bin/sh',
@@ -68,15 +71,28 @@ class TerminalProcess:
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', *size, 0, 0))
         self.before = termios.tcgetattr(self.slave)
+        # BSD sets PENDIN while reprocessing input after ICANON is restored.
+        # It is transient kernel state, not a terminal mode to restore.
+        self.before[3] &= ~getattr(termios, 'PENDIN', 0)
         self.output = b''
+        self._after = None
+        self._closed = False
+        self._snapshot, snapshot_writer = os.pipe()
 
         def terminal_session():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        self.process = subprocess.Popen(command, env=env, stdin=self.slave,
-                                        stdout=self.slave, stderr=self.slave,
-                                        preexec_fn=terminal_session)
+        # A shell normally owns the terminal session. Keep a supervisor in
+        # that role so Darwin does not revoke the tty before we inspect it.
+        helper = os.path.join(os.path.dirname(__file__), 'terminal_child.py')
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, helper, str(snapshot_writer), *command],
+                env=env, stdin=self.slave, stdout=self.slave, stderr=self.slave,
+                preexec_fn=terminal_session, pass_fds=(snapshot_writer,))
+        finally:
+            os.close(snapshot_writer)
 
     def send(self, keys):
         os.write(self.master, keys)
@@ -96,13 +112,35 @@ class TerminalProcess:
     def wait_text(self, text):
         self.wait(lambda: text.encode() in self.output)
 
-    def close(self):
+    @property
+    def after(self):
+        """Terminal modes after the command exits, before Darwin revokes it."""
         if self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=2)
-        os.close(self.master)
-        os.close(self.slave)
+            raise RuntimeError('Command is still running')
+        if self._after is None:
+            with os.fdopen(self._snapshot, 'rb') as snapshot:
+                self._snapshot = None
+                self._after = pickle.load(snapshot)
+                self._after[3] &= ~getattr(termios, 'PENDIN', 0)
+        return self._after
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            if self.process.poll() is None:
+                os.killpg(self.process.pid, signal.SIGTERM)
+                try:
+                    # Darwin drains terminal output during session-leader exit.
+                    # Read it while waiting instead of blocking in Popen.wait.
+                    self.wait(lambda: self.process.poll() is not None, timeout=2)
+                except AssertionError:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                    self.wait(lambda: self.process.poll() is not None, timeout=2)
+        finally:
+            os.close(self.master)
+            os.close(self.slave)
+            if self._snapshot is not None:
+                os.close(self._snapshot)
+                self._snapshot = None
+            self._closed = True
